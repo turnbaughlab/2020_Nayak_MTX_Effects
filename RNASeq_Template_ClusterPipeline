@@ -1,0 +1,87 @@
+!/bin/bash
+#$ -S /bin/bash
+#$ -o rnaSeqPipeline.outputlog.txt
+#$ -e rnaSeqPipeline.errorlog.txt
+#$ -cwd
+#$ -r y
+#$ -j y
+#$ -l mem_free=8G
+#$ -l arch=linux-x64
+#$ -l netapp=20G,scratch=100G
+#$ -l h_rt=336:0:0
+#$ -pe smp  4
+#$ -t 1-18 #This assumes 18 jobs and that your text file you open has a header with names for the columns
+
+FILE="ArraySubmissionReference.txt"
+
+DIR=<directory> #location of a directory where all of your files will be
+READDIR=<directory> #location of reads in fastq format
+
+GTF=($(cut -f5 $FILE)) #GTF or GFF file. Make sure to modify to remove comments, etc
+GTF="${GTF[SGE_TASK_ID]}"
+
+FASTA=($(cut -f3 $FILE)) #name of fasta file but need to append lane information and cat samples across lanes
+FASTA="${FASTA[SGE_TASK_ID]}"
+
+INDEX2=($(cut -f6 $FILE)) #name of indexed reference file for bowtie.
+INDEX2="${INDEX2[SGE_TASK_ID]}"
+
+date
+hostname
+
+#Make directory to store log files
+mkdir -p $DIR/logs
+exec >logs/${FASTA}.SGE${SGE_TASK_ID}.log 2>logs/${FASTA}.SGE${SGE_TASK_ID}.errors
+
+#Decompress fastq.gz files  
+mkdir -p /scratch/decomp_reads_RRN
+gunzip -c  $READDIR/${FASTA}_L001_R1_001.fastq.gz > /scratch/decomp_reads_RRN/${FASTA}_L001_R1_001.fastq
+gunzip -c  $READDIR/${FASTA}_L002_R1_001.fastq.gz > /scratch/decomp_reads_RRN/${FASTA}_L002_R1_001.fastq
+
+#combine reads of same sample distributed across two lanes
+cat /scratch/decomp_reads_RRN/${FASTA}_L001_R1_001.fastq /scratch/decomp_reads_RRN/${FASTA}_L002_R1_001.fastq > /scratch/decomp_reads_RRN/${FASTA}_R1_001.fastq
+
+SAMPLEID=/scratch/decomp_reads_RRN/${FASTA}_R1_001
+
+echo "$(date) $(hostname)   Trimming reads all reads to 80 bp by removing last 15 and first 5"
+java -jar trimmomatic.jar SE -phred33 ${SAMPLEID}.fastq ${SAMPLEID}.trimmed2 CROP:85
+java -jar trimmomatic.jar SE -phred33 ${SAMPLEID}.trimmed2 ${SAMPLEID}.trimmed HEADCROP:5
+
+echo "$(date)   Performing sortmeRNA on $SAMPLEID"
+
+#Location of sortmerna binary
+SORTMEPATH=<directory>
+
+#will add appropriate extension, in this case ".trimmed" to _rRNA and _nonrRNA output files.
+time $SORTMEPATH/sortmerna --ref $SORTMEPATH/rRNA_databases/silva-bac-16s-id90.fasta,$SORTMEPATH/index/silva-bac-16s-db:$SORTMEPATH/rRNA_databases/silva-bac-23s-id98.fasta,$SORTMEPATH/index/silva-bac-23s-db --reads ${SAMPLEID}.trimmed -m 8192 --num_alignments 1 --fastx --aligned ${SAMPLEID}_rRNA --other ${SAMPLEID}_nonrRNA --log -v
+
+#save log file from sortmerna
+cp ${SAMPLEID}_rRNA.log logs/.
+
+source scl_source enable python27
+python --version 
+
+#Align reads to index (which should already be made)
+echo "Aligning fastq $FASTA to reference $REFERENCE with gtf file $GTF and the index $INDEX2 in $READDIR"
+mkdir -p $DIR/alignments
+mkdir -p $DIR/counts
+mkdir -p /scratch/decomp_reads_RRN/unaligned
+mkdir -p /scratch/decomp_reads_RRN/aligned
+echo "$(date)   Aligning $SAMPLEID"
+
+INDEX="index/$INDEX2"
+
+#do not trim reads before aligning since already trimmed
+bowtie2 -q --met-file bowtie2log.txt -p $NSLOTS --end-to-end --sensitive -x $INDEX -U ${SAMPLEID}_nonrRNA.trimmed -S $DIR/alignments/$FASTA.sam --al /scratch/decomp_reads_RRN/aligned/$FASTA.aligned --un /scratch/decomp_reads_RRN/unaligned/$FASTA.unaligned
+
+#Count reads mapping to each CDS
+echo "$(date)   Counting $SAMPLEID"
+htseq-count --type=CDS --idattr=ID --stranded=no --minaqual=10  $DIR/alignments/$FASTA.sam  $DIR/gff/$GTF > $DIR/counts/$FASTA.counts
+
+#Use samtools to create bam files
+echo "$(date)   Baming and sorting $FASTA"
+samtools view -bS --threads $NSLOTS $DIR/alignments/$FASTA.sam > $DIR/alignments/$FASTA.bam
+samtools sort --threads $NSLOTS $DIR/alignments/$FASTA.bam -o $DIR/alignments/$FASTA.sorted.bam
+samtools index -b $DIR/alignments/$FASTA.sorted.bam $DIR/alignments/$FASTA.sorted.bai
+
+echo "$(date) $(hostname) Done with pipeline!"
